@@ -33,7 +33,6 @@ jobs:
       # Build native-module x86_64
       - name: Build native-module (x64)
         run: |
-          cd native-module
           arch -x86_64 napi build --release --target x86_64-apple-darwin
 
       # Zip folder native-module
