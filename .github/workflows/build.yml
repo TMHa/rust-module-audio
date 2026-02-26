@@ -1,0 +1,225 @@
+name: Build Native Module
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS
+          - target: x86_64-apple-darwin
+            os: macos-12
+            platform: darwin
+            arch: x64
+          - target: aarch64-apple-darwin
+            os: macos-14
+            platform: darwin
+            arch: arm64
+
+          # Linux
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-20.04
+            platform: linux
+            arch: x64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-20.04-arm64
+            platform: linux
+            arch: arm64
+
+          # Windows
+          - target: x86_64-pc-windows-msvc
+            os: windows-2019
+            platform: win32
+            arch: x64
+
+    name: Build ${{ matrix.platform }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build native module
+        run: napi build --platform --release
+        env:
+          RUSTFLAGS: --cfg web_sys_unstable_apis
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          # Create output directory
+          mkdir -p artifacts/${{ matrix.platform }}-${{ matrix.arch }}
+
+          # Copy files based on platform
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            # Windows
+            if [ "${{ matrix.arch }}" == "x64" ]; then
+              cp index.win32-x64-msvc.node artifacts/${{ matrix.platform }}-${{ matrix.arch }}/ || true
+            fi
+          elif [ "${{ runner.os }}" == "macOS" ]; then
+            # macOS
+            if [ "${{ matrix.arch }}" == "x64" ]; then
+              cp index.darwin-x64.node artifacts/${{ matrix.platform }}-${{ matrix.arch }}/ || true
+            else
+              cp index.darwin-arm64.node artifacts/${{ matrix.platform }}-${{ matrix.arch }}/ || true
+            fi
+          else
+            # Linux
+            if [ "${{ matrix.arch }}" == "x64" ]; then
+              cp index.linux-x64-gnu.node artifacts/${{ matrix.platform }}-${{ matrix.arch }}/ || true
+            else
+              cp index.linux-arm64-gnu.node artifacts/${{ matrix.platform }}-${{ matrix.arch }}/ || true
+            fi
+          fi
+
+          # Copy type definitions and package.json
+          cp index.d.ts artifacts/${{ matrix.platform }}-${{ matrix.arch }}/
+          cp package.json artifacts/${{ matrix.platform }}-${{ matrix.arch }}/
+
+          # List files for debugging
+          ls -la
+          echo "---"
+          ls -la artifacts/${{ matrix.platform }}-${{ matrix.arch }}/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: natively-audio-${{ matrix.platform }}-${{ matrix.arch }}
+          path: artifacts/${{ matrix.platform }}-${{ matrix.arch }}/**
+
+  create-release-zip:
+    name: Create Release Zip
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create zip packages
+        run: |
+          mkdir -p release
+          cd artifacts
+
+          # Create individual zip for each platform
+          for dir in */; do
+            platform=$(echo "$dir" | tr -d '/')
+            echo "Creating zip for $platform..."
+            cd "$dir"
+            zip -r "../../release/$platform.zip" .
+            cd ..
+          done
+
+          # Create all-in-one zip
+          cd ..
+          cd artifacts
+          zip -r ../release/natively-audio-full.zip .
+
+      - name: Upload release zips
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-zips
+          path: release/*.zip
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release/*.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  combine-artifacts:
+    name: Combine All Artifacts (Manual Trigger)
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create combined zip
+        run: |
+          mkdir -p release
+          cd artifacts
+
+          # Organize by platform in the zip
+          mkdir -p ../natively-audio-builds
+          for dir in */; do
+            platform=$(echo "$dir" | tr -d '/')
+            echo "Processing $platform..."
+            cp -r "$dir"* ../natively-audio-builds/
+          done
+
+          # Create README for the zip
+          cat > ../natively-audio-builds/README.md << 'EOF'
+          # Natively Audio - Native Module Builds
+
+          This package contains pre-built native modules for multiple platforms.
+
+          ## Platform-Specific Builds
+
+          Each directory contains the pre-built `.node` file, type definitions, and package.json for your platform.
+
+          ## Directory Structure
+
+          - `darwin-x64/` - macOS Intel (x64)
+          - `darwin-arm64/` - macOS Apple Silicon (M1/M2/M3)
+          - `linux-x64-gnu/` - Linux x64
+          - `linux-arm64-gnu/` - Linux ARM64
+          - `win32-x64-msvc/` - Windows x64
+
+          ## Usage
+
+          1. Identify your platform directory
+          2. Copy the relevant `.node` file to your project
+          3. Ensure your package.json or code references the correct file
+
+          If using with napi-rs, you may need to adjust the loading code to use the specific platform build.
+          EOF
+
+          cd ..
+          zip -r release/natively-audio-builds.zip natively-audio-builds/
+
+      - name: Upload combined zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: natively-audio-builds
+          path: release/natively-audio-builds.zip
