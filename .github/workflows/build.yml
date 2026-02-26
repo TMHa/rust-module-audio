@@ -32,8 +32,7 @@ jobs:
 
       # Build native-module x86_64
       - name: Build native-module (x64)
-        run: |
-          arch -x86_64 napi build --release --target x86_64-apple-darwin
+        run: npx napi build --release --target x86_64-apple-darwin
 
       # Zip folder native-module
       - name: Zip native-module
