@@ -33,7 +33,11 @@ jobs:
 
       # Build native-module x86_64
       - name: Build native-module (x64)
-        run: arch -x86_64 npx napi build --release
+        # run: arch -x86_64 npx napi build --release
+        run: |
+          export CARGO_BUILD_TARGET=x86_64-apple-darwin
+          export RUSTFLAGS="-C target-cpu=x86-64"
+          npx napi build --release --target x86_64-apple-darwin
 
       # Zip native-module artifacts
       - name: Zip native-module
