@@ -14,12 +14,6 @@ jobs:
       - name: Install Rosetta
         run: softwareupdate --install-rosetta --agree-to-license || true
 
-      # Install Node.js x86_64 for cross-compilation
-      - name: Install Node.js x64
-        run: |
-          curl -o node.pkg https://nodejs.org/dist/v20.11.1/node-v20.11.1-x64.pkg
-          sudo installer -pkg node.pkg -target /
-
       # Install Rust
       - uses: dtolnay/rust-toolchain@stable
 
@@ -27,7 +21,13 @@ jobs:
       - name: Add x64 rust target
         run: rustup target add x86_64-apple-darwin
 
-      # Install dependencies
+      # Install Node.js x64 for native x86_64 build
+      - name: Install Node.js x64
+        run: |
+          curl -L https://nodejs.org/dist/v20.13.0/node-v20.13.0-darwin-x64.tar.gz | tar -xz
+          echo "$(pwd)/node-v20.13.0-darwin-x64/bin" >> $GITHUB_PATH
+
+      # Install dependencies with Node.js x64
       - name: Install deps
         run: arch -x86_64 npm install
 
