@@ -10,37 +10,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Cài Rosetta để chạy x86_64
+      # Install Rosetta for x86_64 support
       - name: Install Rosetta
         run: softwareupdate --install-rosetta --agree-to-license || true
 
-      # Setup Node (arm runner)
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
+      # Install Node.js x86_64 for cross-compilation
+      - name: Install Node.js x64
+        run: |
+          curl -o node.pkg https://nodejs.org/dist/v20.11.1/node-v20.11.1-x64.pkg
+          sudo installer -pkg node.pkg -target /
 
-      # Cài Rust
+      # Install Rust
       - uses: dtolnay/rust-toolchain@stable
 
-      # Thêm target x86_64 cho Rust
+      # Add x64 rust target
       - name: Add x64 rust target
         run: rustup target add x86_64-apple-darwin
 
-      # Cài dependencies dưới x86_64
-      - name: Install deps (x64)
+      # Install dependencies
+      - name: Install deps
         run: arch -x86_64 npm install
 
       # Build native-module x86_64
       - name: Build native-module (x64)
-        run: npx napi build --release --target x86_64-apple-darwin
+        run: arch -x86_64 npx napi build --release
 
-      # Zip folder native-module
+      # Zip native-module artifacts
       - name: Zip native-module
-        run: zip -r native-module-x64.zip native-module
+        run: zip -r native-module-x64.zip *.node *.js *.d.ts
 
       # Upload zip
       - uses: actions/upload-artifact@v4
         with:
           name: native-module-x64
           path: native-module-x64.zip
-
