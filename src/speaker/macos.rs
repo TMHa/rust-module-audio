@@ -1,5 +1,6 @@
 use anyhow::Result;
 use ringbuf::HeapCons;
+use std::sync::{Arc, Mutex, Condvar};
 use super::core_audio;
 use super::sck;
 
@@ -42,13 +43,6 @@ impl SpeakerInput {
     pub fn stream(self) -> SpeakerStream {
         match self.backend {
             BackendInput::CoreAudio(input) => {
-                // We wrap the stream creation to catch potential panics if start_device fails
-                // Ideally core_audio::stream should return Result, but for now we rely on it working if new worked.
-                // If it crashes, we can't easily fallback here without changing signature.
-                // But core_audio::new does most of the heavy lifting.
-                // NOTE: core_audio::stream() currently panics on start failure. 
-                // We should assume it works or modify core_audio.rs. 
-                // Given the constraints, let's assume if tap creation worked, starting works.
                 let stream = input.stream();
                 SpeakerStream { backend: BackendStream::CoreAudio(stream) }
             },
@@ -83,6 +77,12 @@ impl SpeakerStream {
              BackendStream::Sck(s) => s.take_consumer(),
         }
     }
+
+    /// Get the Condvar for DSP thread to wait on audio data
+    pub fn data_ready_signal(&self) -> Arc<(Mutex<bool>, Condvar)> {
+        match &self.backend {
+            BackendStream::CoreAudio(s) => s.data_ready_signal(),
+            BackendStream::Sck(s) => s.data_ready_signal(),
+        }
+    }
 }
-
-

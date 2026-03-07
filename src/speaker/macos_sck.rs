@@ -5,6 +5,7 @@ use anyhow::Result;
 use cidre::{arc, sc, cm, dispatch, ns, objc, define_obj_type};
 use cidre::sc::StreamOutput;
 use ringbuf::{traits::{Producer, Split}, HeapProd, HeapRb, HeapCons};
+use std::sync::{Arc, Mutex, Condvar};
 
 // keep for compatibility
 use cidre::core_audio as ca;
@@ -28,6 +29,8 @@ pub fn list_output_devices() -> Result<Vec<(String, String)>> {
 
 pub struct AudioHandlerInner {
     producer: HeapProd<f32>,
+    /// Condvar to notify the DSP thread when new audio data is available
+    data_ready: Arc<(Mutex<bool>, Condvar)>,
 }
 
 define_obj_type!(
@@ -75,6 +78,12 @@ impl sc::stream::OutputImpl for AudioHandler {
                             // Push audio to ring buffer
                             let _pushed = inner.producer.push_slice(slice);
                         }
+                        // Signal DSP thread that data is available
+                        let (lock, cvar) = &*inner.data_ready;
+                        if let Ok(mut ready) = lock.lock() {
+                            *ready = true;
+                            cvar.notify_one();
+                        }
                     }
                 }
             }
@@ -121,12 +130,19 @@ impl SpeakerInput {
             ready_clone.store(true, Ordering::SeqCst);
         });
         
-        // Wait for shareable content (max 5 seconds)
-        for _ in 0..500 {
-            if content_ready.load(Ordering::SeqCst) {
-                break;
+        // Wait for shareable content using Condvar (max 5 seconds)
+        let wait_pair = Arc::new((Mutex::new(false), Condvar::new()));
+        let (wait_lock, wait_cvar) = &*wait_pair;
+        {
+            let mut ready = wait_lock.lock().unwrap();
+            let deadline = std::time::Duration::from_secs(5);
+            while !content_ready.load(Ordering::SeqCst) {
+                let result = wait_cvar.wait_timeout(ready, deadline).unwrap();
+                ready = result.0;
+                if result.1.timed_out() {
+                    break;
+                }
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         
         if content_error.load(Ordering::SeqCst) {
@@ -176,10 +192,13 @@ impl SpeakerInput {
         let rb = HeapRb::<f32>::new(buffer_size);
         let (producer, consumer) = rb.split();
         
+        // Shared Condvar for DSP thread wakeup
+        let data_ready = Arc::new((Mutex::new(false), Condvar::new()));
+        
         let stream = sc::Stream::new(&self.filter, &self.cfg);
         
-        // Initialize handler
-        let inner = AudioHandlerInner { producer };
+        // Initialize handler with Condvar
+        let inner = AudioHandlerInner { producer, data_ready: data_ready.clone() };
         let handler = AudioHandler::with(inner);
         
         let queue = dispatch::Queue::serial_with_ar_pool();
@@ -211,12 +230,19 @@ impl SpeakerInput {
             complete_clone.store(true, Ordering::SeqCst);
         });
         
-        // Wait for start completion (max 2 seconds)
-        for _ in 0..200 {
-            if start_complete.load(Ordering::SeqCst) {
-                break;
+        // Wait for start completion using Condvar (max 2 seconds)
+        let start_wait = Arc::new((Mutex::new(false), Condvar::new()));
+        let (sw_lock, sw_cvar) = &*start_wait;
+        {
+            let mut ready = sw_lock.lock().unwrap();
+            let deadline = std::time::Duration::from_secs(2);
+            while !start_complete.load(Ordering::SeqCst) {
+                let result = sw_cvar.wait_timeout(ready, deadline).unwrap();
+                ready = result.0;
+                if result.1.timed_out() {
+                    break;
+                }
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         
         let status = start_error.load(Ordering::SeqCst);
@@ -228,6 +254,7 @@ impl SpeakerInput {
         
         SpeakerStream {
             consumer: Some(consumer),
+            data_ready,
             stream,
             _handler: handler,
             _filter: self.filter,
@@ -238,6 +265,8 @@ impl SpeakerInput {
 
 pub struct SpeakerStream {
     consumer: Option<HeapCons<f32>>,
+    /// Condvar for DSP thread to wait on (signaled by audio callback)
+    data_ready: Arc<(Mutex<bool>, Condvar)>,
     stream: arc::R<sc::Stream>,
     _handler: arc::R<AudioHandler>,
     _filter: arc::R<sc::ContentFilter>,
@@ -251,6 +280,11 @@ impl SpeakerStream {
     
     pub fn take_consumer(&mut self) -> Option<HeapCons<f32>> {
         self.consumer.take()
+    }
+
+    /// Get the Condvar for DSP thread to wait on audio data
+    pub fn data_ready_signal(&self) -> Arc<(Mutex<bool>, Condvar)> {
+        self.data_ready.clone()
     }
 }
 
