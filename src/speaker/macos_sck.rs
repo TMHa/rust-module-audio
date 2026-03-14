@@ -98,35 +98,48 @@ impl SpeakerInput {
         // The device_id parameter is ignored
         
         // Get available content - triggers permission check
-        // Use blocking wait since we're in a sync context
-        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-        use std::cell::UnsafeCell;
+        // Use Condvar to efficiently wait for the async callback without busy-spinning.
+        use std::sync::{Arc, Mutex, Condvar, atomic::{AtomicBool, Ordering}};
         
-        let content_cell: Arc<UnsafeCell<Option<arc::R<sc::ShareableContent>>>> = Arc::new(UnsafeCell::new(None));
-        let content_ready = Arc::new(AtomicBool::new(false));
+        // Use Mutex instead of UnsafeCell for sound cross-thread sharing.
+        let content_cell: Arc<Mutex<Option<arc::R<sc::ShareableContent>>>> = Arc::new(Mutex::new(None));
         let content_error = Arc::new(AtomicBool::new(false));
         
+        // Condvar pair for signaling callback completion
+        let pair = Arc::new((Mutex::new(false), Condvar::new()));
+        
         let cell_clone = content_cell.clone();
-        let ready_clone = content_ready.clone();
         let error_clone = content_error.clone();
+        let pair_clone = pair.clone();
         
         sc::ShareableContent::current_with_ch(move |content_opt, error_opt| {
             if let Some(e) = error_opt {
                 println!("[SpeakerInput] ERROR: ScreenCaptureKit access denied: {:?}", e);
                 error_clone.store(true, Ordering::SeqCst);
             } else if let Some(c) = content_opt {
-                // Retain the content
-                unsafe { *cell_clone.get() = Some(c.retained()); }
+                // Store content via Mutex (sound and thread-safe)
+                if let Ok(mut guard) = cell_clone.lock() {
+                    *guard = Some(c.retained());
+                }
             }
-            ready_clone.store(true, Ordering::SeqCst);
+            // Signal the waiting thread
+            let (lock, cvar) = &*pair_clone;
+            let mut ready = lock.lock().unwrap();
+            *ready = true;
+            cvar.notify_one();
         });
         
-        // Wait for shareable content (max 5 seconds)
-        for _ in 0..500 {
-            if content_ready.load(Ordering::SeqCst) {
-                break;
+        // Wait for shareable content (max 30 seconds — allows time for macOS permission dialog)
+        {
+            let (lock, cvar) = &*pair;
+            let mut ready = lock.lock().unwrap();
+            if !*ready {
+                let result = cvar.wait_timeout(ready, std::time::Duration::from_secs(30)).unwrap();
+                ready = result.0;
+                if !*ready {
+                    println!("[SpeakerInput] Timed out waiting for ScreenCaptureKit permission (30s)");
+                }
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         
         if content_error.load(Ordering::SeqCst) {
@@ -134,7 +147,7 @@ impl SpeakerInput {
             return Err(anyhow::anyhow!("ScreenCaptureKit access denied"));
         }
         
-        let content = unsafe { (*content_cell.get()).take() }
+        let content = content_cell.lock().unwrap().take()
             .ok_or_else(|| anyhow::anyhow!("Failed to get shareable content (timeout)"))?;
         
         let displays = content.displays();
@@ -191,13 +204,15 @@ impl SpeakerInput {
         // Start with completion handler to detect errors
         println!("[SpeakerInput] Starting ScreenCaptureKit stream...");
         
-        use std::sync::{Arc, atomic::{AtomicBool, AtomicU8, Ordering}};
+        use std::sync::{Arc, Mutex, Condvar, atomic::{AtomicU8, Ordering}};
         
-        let start_complete = Arc::new(AtomicBool::new(false));
         let start_error = Arc::new(AtomicU8::new(0)); // 0 = pending, 1 = success, 2 = error
         
-        let complete_clone = start_complete.clone();
+        // Condvar pair for signaling stream start completion
+        let start_pair = Arc::new((Mutex::new(false), Condvar::new()));
+        
         let error_clone = start_error.clone();
+        let pair_clone = start_pair.clone();
         
         stream.start_with_ch(move |err| {
             if let Some(e) = err {
@@ -208,20 +223,29 @@ impl SpeakerInput {
                 println!("[SpeakerInput] ✅ Stream started successfully!");
                 error_clone.store(1, Ordering::SeqCst);
             }
-            complete_clone.store(true, Ordering::SeqCst);
+            // Signal the waiting thread
+            let (lock, cvar) = &*pair_clone;
+            let mut complete = lock.lock().unwrap();
+            *complete = true;
+            cvar.notify_one();
         });
         
-        // Wait for start completion (max 2 seconds)
-        for _ in 0..200 {
-            if start_complete.load(Ordering::SeqCst) {
-                break;
+        // Wait for start completion (max 10 seconds)
+        {
+            let (lock, cvar) = &*start_pair;
+            let mut complete = lock.lock().unwrap();
+            if !*complete {
+                let result = cvar.wait_timeout(complete, std::time::Duration::from_secs(10)).unwrap();
+                complete = result.0;
+                if !*complete {
+                    println!("[SpeakerInput] WARNING: Start callback not received after 10s");
+                }
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         
         let status = start_error.load(Ordering::SeqCst);
         if status == 0 {
-            println!("[SpeakerInput] WARNING: Start callback not received after 2s");
+            println!("[SpeakerInput] WARNING: Start callback not received in time");
         } else if status == 2 {
             println!("[SpeakerInput] WARNING: Stream started with error - audio may not work");
         }
@@ -256,10 +280,30 @@ impl SpeakerStream {
 
 impl Drop for SpeakerStream {
     fn drop(&mut self) {
+        use std::sync::{Arc, Mutex, Condvar};
+        
         println!("[SpeakerStream] Stopping ScreenCaptureKit stream...");
-        self.stream.stop_with_ch(|_| {
+        
+        let stop_pair = Arc::new((Mutex::new(false), Condvar::new()));
+        let pair_clone = stop_pair.clone();
+        
+        self.stream.stop_with_ch(move |_| {
             println!("[SpeakerStream] Stream stopped");
+            let (lock, cvar) = &*pair_clone;
+            let mut stopped = lock.lock().unwrap();
+            *stopped = true;
+            cvar.notify_one();
         });
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        
+        // Wait for stop completion (max 1 second)
+        let (lock, cvar) = &*stop_pair;
+        let mut stopped = lock.lock().unwrap();
+        if !*stopped {
+            let result = cvar.wait_timeout(stopped, std::time::Duration::from_secs(1)).unwrap();
+            stopped = result.0;
+            if !*stopped {
+                println!("[SpeakerStream] WARNING: Stop callback not received after 1s");
+            }
+        }
     }
 }

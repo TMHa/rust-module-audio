@@ -21,6 +21,7 @@ pub mod silence_suppression;
 
 // Keep old resampler module for compatibility
 pub mod resampler;
+pub mod license;
 
 use crate::streaming_resampler::StreamingResampler;
 use crate::audio_config::{FRAME_SAMPLES, DSP_POLL_MS};
@@ -102,7 +103,10 @@ impl SystemAudioCapture {
         
         self.stream = Some(stream);
 
-        // DSP thread with silence suppression
+        // Get the data-ready Condvar from the speaker stream
+        let data_ready = self.stream.as_ref().unwrap().data_ready_signal();
+
+        // DSP thread with silence suppression + Condvar wakeup
         self.capture_thread = Some(thread::spawn(move || {
             let mut resampler = StreamingResampler::new(input_sample_rate, 16000.0);
             let mut frame_buffer: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES * 4);
@@ -153,9 +157,15 @@ impl SystemAudioCapture {
                     }
                 }
                 
-                // 4. Short sleep
+                // 4. Wait for audio data (Condvar or timeout fallback)
                 if frame_buffer.len() < FRAME_SAMPLES {
-                    thread::sleep(Duration::from_millis(DSP_POLL_MS));
+                    let (ref lock, ref cvar) = *data_ready;
+                    let mut ready = lock.lock().unwrap();
+                    if !*ready {
+                        let (guard, _) = cvar.wait_timeout(ready, Duration::from_millis(DSP_POLL_MS)).unwrap();
+                        ready = guard;
+                    }
+                    *ready = false;
                 }
             }
             
@@ -235,7 +245,10 @@ impl MicrophoneCapture {
         let mut consumer = input_ref.take_consumer()
             .ok_or_else(|| napi::Error::from_reason("Failed to get consumer"))?;
 
-        // DSP thread with silence suppression
+        // Get the data-ready Condvar from the microphone stream
+        let data_ready = input_ref.data_ready_signal();
+
+        // DSP thread with silence suppression + Condvar wakeup
         self.capture_thread = Some(thread::spawn(move || {
             let mut resampler = StreamingResampler::new(input_sample_rate, 16000.0);
             let mut frame_buffer: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES * 4);
@@ -286,9 +299,15 @@ impl MicrophoneCapture {
                     }
                 }
                 
-                // 4. Short sleep
+                // 4. Wait for audio data (Condvar or timeout fallback)
                 if frame_buffer.len() < FRAME_SAMPLES {
-                    thread::sleep(Duration::from_millis(DSP_POLL_MS));
+                    let (ref lock, ref cvar) = *data_ready;
+                    let mut ready = lock.lock().unwrap();
+                    if !*ready {
+                        let (guard, _) = cvar.wait_timeout(ready, Duration::from_millis(DSP_POLL_MS)).unwrap();
+                        ready = guard;
+                    }
+                    *ready = false;
                 }
             }
             

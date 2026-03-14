@@ -13,9 +13,10 @@
 use std::time::{Duration, Instant};  // Added for timing
 
 /// Configuration for silence suppression
-/// Optimized for low latency
+/// Optimized for low latency with adaptive threshold
 pub struct SilenceSuppressionConfig {
-    /// RMS threshold for speech detection (i16 scale: 0-32767)
+    /// Initial RMS threshold for speech detection (i16 scale: 0-32767)
+    /// Acts as starting value; adaptive tracking adjusts this over time.
     pub speech_threshold_rms: f32,
     
     /// Duration to continue sending full audio after speech ends
@@ -24,14 +25,26 @@ pub struct SilenceSuppressionConfig {
     
     /// How often to send a keepalive frame during silence
     pub silence_keepalive_interval: Duration,
+
+    /// Multiplier above the noise floor EMA to detect speech (default: 3.0)
+    pub adaptive_multiplier: f32,
+
+    /// Minimum floor for the adaptive threshold (prevents false triggers in dead silence)
+    pub adaptive_min_floor: f32,
+
+    /// EMA smoothing factor (0..1). Lower = slower adaptation. Default 0.02.
+    pub ema_alpha: f32,
 }
 
 impl Default for SilenceSuppressionConfig {
     fn default() -> Self {
         Self {
-            speech_threshold_rms: 100.0,  // Lower = more sensitive
-            speech_hangover: Duration::from_millis(200),  // Shorter = faster cost savings
+            speech_threshold_rms: 100.0,  // Initial threshold (will adapt)
+            speech_hangover: Duration::from_millis(200),
             silence_keepalive_interval: Duration::from_millis(100),
+            adaptive_multiplier: 3.0,
+            adaptive_min_floor: 20.0,
+            ema_alpha: 0.02,
         }
     }
 }
@@ -40,10 +53,12 @@ impl SilenceSuppressionConfig {
     /// Create config for system audio (very permissive - system audio is quieter)
     pub fn for_system_audio() -> Self {
         Self {
-            // System audio often has much lower levels
-            speech_threshold_rms: 30.0,  // Very low threshold
+            speech_threshold_rms: 30.0,  // Lower starting threshold
             speech_hangover: Duration::from_millis(300),
             silence_keepalive_interval: Duration::from_millis(100),
+            adaptive_multiplier: 3.0,
+            adaptive_min_floor: 10.0,  // Lower floor for system audio
+            ema_alpha: 0.02,
         }
     }
     
@@ -53,11 +68,14 @@ impl SilenceSuppressionConfig {
             speech_threshold_rms: 100.0,
             speech_hangover: Duration::from_millis(200),
             silence_keepalive_interval: Duration::from_millis(100),
+            adaptive_multiplier: 3.0,
+            adaptive_min_floor: 20.0,
+            ema_alpha: 0.02,
         }
     }
 }
 
-/// Silence suppression state machine
+/// Silence suppression state machine with adaptive threshold
 pub struct SilenceSuppressor {
     config: SilenceSuppressionConfig,
     state: SuppressionState,
@@ -65,6 +83,10 @@ pub struct SilenceSuppressor {
     last_keepalive_time: Instant,
     frames_sent: u64,
     frames_suppressed: u64,
+    /// Exponential moving average of ambient noise floor RMS
+    noise_floor_ema: f32,
+    /// Current adaptive speech threshold
+    adaptive_threshold: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -88,12 +110,15 @@ pub enum FrameAction {
 impl SilenceSuppressor {
     pub fn new(config: SilenceSuppressionConfig) -> Self {
         let now = Instant::now();
-        println!("[SilenceSuppressor] Created with threshold={}, hangover={}ms, keepalive={}ms",
+        let initial_threshold = config.speech_threshold_rms;
+        println!("[SilenceSuppressor] Created with threshold={} (adaptive), hangover={}ms, keepalive={}ms",
             config.speech_threshold_rms,
             config.speech_hangover.as_millis(),
             config.silence_keepalive_interval.as_millis()
         );
         Self {
+            noise_floor_ema: config.adaptive_min_floor,
+            adaptive_threshold: initial_threshold,
             config,
             state: SuppressionState::Active, // Start in active to not miss first words
             last_speech_time: now,
@@ -108,7 +133,7 @@ impl SilenceSuppressor {
     pub fn process(&mut self, frame: &[i16]) -> FrameAction {
         let now = Instant::now();
         let rms = calculate_rms(frame);
-        let has_speech = rms >= self.config.speech_threshold_rms;
+        let has_speech = rms >= self.adaptive_threshold;
         
         // ALWAYS check for speech first - immediate response
         if has_speech {
@@ -137,7 +162,14 @@ impl SilenceSuppressor {
             }
         }
         
-        // In suppressed state - check if time for keepalive
+        // In suppressed state - update adaptive noise floor EMA
+        // Only adapt during confirmed silence to avoid tracking speech levels
+        let alpha = self.config.ema_alpha;
+        self.noise_floor_ema = self.noise_floor_ema * (1.0 - alpha) + rms * alpha;
+        self.adaptive_threshold = (self.noise_floor_ema * self.config.adaptive_multiplier)
+            .max(self.config.adaptive_min_floor);
+
+        // Check if time for keepalive
         if now.duration_since(self.last_keepalive_time) >= self.config.silence_keepalive_interval {
             self.last_keepalive_time = now;
             self.frames_sent += 1;
@@ -164,6 +196,8 @@ impl SilenceSuppressor {
         self.state = SuppressionState::Active;
         self.last_speech_time = now;
         self.last_keepalive_time = now;
+        self.noise_floor_ema = self.config.adaptive_min_floor;
+        self.adaptive_threshold = self.config.speech_threshold_rms;
     }
 }
 
@@ -211,6 +245,9 @@ mod tests {
             speech_threshold_rms: 100.0,
             speech_hangover: Duration::from_millis(0),
             silence_keepalive_interval: Duration::from_millis(50),
+            adaptive_multiplier: 3.0,
+            adaptive_min_floor: 20.0,
+            ema_alpha: 0.02,
         });
         
         let silent_frame: Vec<i16> = vec![0; 320];

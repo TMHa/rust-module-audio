@@ -11,6 +11,7 @@ use cpal::{SampleFormat, Stream};
 use ringbuf::{traits::{Producer, Consumer, Split}, HeapRb, HeapProd, HeapCons};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, Condvar};
 
 use crate::audio_config::RING_BUFFER_SAMPLES;
 
@@ -39,6 +40,8 @@ pub struct MicrophoneStream {
     consumer: Option<HeapCons<f32>>,
     sample_rate: u32,
     is_running: Arc<AtomicBool>,
+    /// Condvar for DSP thread to wait on audio data
+    data_ready: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl MicrophoneStream {
@@ -67,6 +70,10 @@ impl MicrophoneStream {
         
         let is_running = Arc::new(AtomicBool::new(false));
         let is_running_clone = is_running.clone();
+
+        // Shared Condvar for DSP thread wakeup
+        let data_ready = Arc::new((Mutex::new(false), Condvar::new()));
+        let data_ready_clone = data_ready.clone();
         
         // Build the stream with minimal callback
         let stream = build_input_stream(
@@ -74,7 +81,8 @@ impl MicrophoneStream {
             &config, 
             producer, 
             channels, 
-            is_running_clone
+            is_running_clone,
+            data_ready_clone,
         )?;
         
         Ok(Self {
@@ -82,6 +90,7 @@ impl MicrophoneStream {
             consumer: Some(consumer),
             sample_rate,
             is_running,
+            data_ready,
         })
     }
 
@@ -119,6 +128,11 @@ impl MicrophoneStream {
     pub fn is_running(&self) -> bool {
         self.is_running.load(Ordering::SeqCst)
     }
+
+    /// Get the Condvar for DSP thread to wait on audio data
+    pub fn data_ready_signal(&self) -> Arc<(Mutex<bool>, Condvar)> {
+        self.data_ready.clone()
+    }
 }
 
 /// Build input stream with lock-free callback
@@ -131,11 +145,13 @@ fn build_input_stream(
     mut producer: HeapProd<f32>,
     channels: usize,
     is_running: Arc<AtomicBool>,
+    data_ready: Arc<(Mutex<bool>, Condvar)>,
 ) -> Result<Stream> {
     let err_fn = |err| eprintln!("[Microphone] Stream error: {}", err);
     
     let stream = match config.sample_format() {
         SampleFormat::F32 => {
+            let data_ready_f32 = data_ready.clone();
             device.build_input_stream(
                 &config.clone().into(),
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
@@ -143,14 +159,18 @@ fn build_input_stream(
                         return;
                     }
                     // REAL-TIME SAFE: Only lock-free push
-                    // Convert stereo to mono if needed, then push
                     if channels > 1 {
-                        // Take first channel only (interleaved)
                         for chunk in data.chunks(channels) {
                             let _ = producer.try_push(chunk[0]);
                         }
                     } else {
                         let _ = producer.push_slice(data);
+                    }
+                    // Signal DSP thread
+                    let (lock, cvar) = &*data_ready_f32;
+                    if let Ok(mut ready) = lock.lock() {
+                        *ready = true;
+                        cvar.notify_one();
                     }
                 },
                 err_fn,
@@ -158,6 +178,7 @@ fn build_input_stream(
             )?
         }
         SampleFormat::I16 => {
+            let data_ready_i16 = data_ready.clone();
             device.build_input_stream(
                 &config.clone().into(),
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
@@ -175,12 +196,19 @@ fn build_input_stream(
                             let _ = producer.try_push(sample as f32 / 32768.0);
                         }
                     }
+                    // Signal DSP thread
+                    let (lock, cvar) = &*data_ready_i16;
+                    if let Ok(mut ready) = lock.lock() {
+                        *ready = true;
+                        cvar.notify_one();
+                    }
                 },
                 err_fn,
                 None,
             )?
         }
         SampleFormat::I32 => {
+            let data_ready_i32 = data_ready;
             device.build_input_stream(
                 &config.clone().into(),
                 move |data: &[i32], _: &cpal::InputCallbackInfo| {
@@ -197,6 +225,12 @@ fn build_input_stream(
                         for &sample in data {
                             let _ = producer.try_push(sample as f32 / 2147483648.0);
                         }
+                    }
+                    // Signal DSP thread
+                    let (lock, cvar) = &*data_ready_i32;
+                    if let Ok(mut ready) = lock.lock() {
+                        *ready = true;
+                        cvar.notify_one();
                     }
                 },
                 err_fn,
