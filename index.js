@@ -116,7 +116,7 @@ switch (platform) {
         nativeBinding = require('natively-audio-darwin-universal')
       }
       break
-    } catch { }
+    } catch {}
     switch (arch) {
       case 'x64':
         localFileExisted = existsSync(join(__dirname, 'index.darwin-x64.node'))
@@ -310,11 +310,9 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { SystemAudioCapture, MicrophoneCapture, getInputDevices, getOutputDevices, getHardwareId, verifyGumroadKey } = nativeBinding
+const { SystemAudioCapture, MicrophoneCapture, getInputDevices, getOutputDevices } = nativeBinding
 
 module.exports.SystemAudioCapture = SystemAudioCapture
 module.exports.MicrophoneCapture = MicrophoneCapture
 module.exports.getInputDevices = getInputDevices
 module.exports.getOutputDevices = getOutputDevices
-module.exports.getHardwareId = getHardwareId
-module.exports.verifyGumroadKey = verifyGumroadKey

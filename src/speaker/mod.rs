@@ -20,6 +20,8 @@ pub mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::SpeakerInput;
 #[cfg(target_os = "windows")]
+pub use windows::SpeakerStream;
+#[cfg(target_os = "windows")]
 pub use windows::list_output_devices;
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]

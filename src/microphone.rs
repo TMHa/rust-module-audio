@@ -8,7 +8,7 @@
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
-use ringbuf::{traits::{Producer, Consumer, Split}, HeapRb, HeapProd, HeapCons};
+use ringbuf::{traits::{Producer, Split}, HeapRb, HeapProd, HeapCons};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Condvar};
