@@ -1,14 +1,15 @@
 // Ported logic
 use anyhow::Result;
 use std::collections::VecDeque;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, Condvar};
 use std::thread;
 use std::time::Duration;
 use tracing::error;
-use wasapi::{get_default_device, DeviceCollection, Direction, SampleType, StreamMode, WaveFormat};
+use wasapi::{get_default_device, DeviceCollection, Direction, SampleType, WaveFormat, ShareMode};
+use ringbuf::{traits::{Producer, Split}, HeapRb, HeapProd, HeapCons};
+use crate::audio_config::RING_BUFFER_SAMPLES;
 
 struct WakerState {
-    // waker: Option<Waker>, // Not used in NAPI context directly same way
     shutdown: bool,
 }
 
@@ -17,10 +18,11 @@ pub struct SpeakerInput {
 }
 
 pub struct SpeakerStream {
-    sample_queue: Arc<Mutex<VecDeque<f32>>>,
+    consumer: Option<HeapCons<f32>>,
     waker_state: Arc<Mutex<WakerState>>,
     capture_thread: Option<thread::JoinHandle<()>>,
     actual_sample_rate: u32,
+    data_ready: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl SpeakerStream {
@@ -28,17 +30,12 @@ impl SpeakerStream {
         self.actual_sample_rate
     }
     
-    // Read available samples
-    pub fn read_chunk(&mut self, max_samples: usize) -> Vec<f32> {
-        let mut queue = self.sample_queue.lock().unwrap();
-        let count = std::cmp::min(queue.len(), max_samples);
-        let mut samples = Vec::with_capacity(count);
-        for _ in 0..count {
-            if let Some(s) = queue.pop_front() {
-                samples.push(s);
-            }
-        }
-        samples
+    pub fn take_consumer(&mut self) -> Option<HeapCons<f32>> {
+        self.consumer.take()
+    }
+
+    pub fn data_ready_signal(&self) -> Arc<(Mutex<bool>, Condvar)> {
+        self.data_ready.clone()
     }
 }
 
@@ -60,8 +57,8 @@ fn find_device_by_id(direction: &Direction, device_id: &str) -> Option<wasapi::D
 }
 
 pub fn list_output_devices() -> Result<Vec<(String, String)>> {
-    let collection = DeviceCollection::new(&Direction::Render)?;
-    let count = collection.get_nbr_devices()?;
+    let collection = DeviceCollection::new(&Direction::Render).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let count = collection.get_nbr_devices().map_err(|e| anyhow::anyhow!("{}", e))?;
     let mut list = Vec::new();
 
     for i in 0..count {
@@ -83,18 +80,21 @@ impl SpeakerInput {
     }
 
     pub fn stream(self) -> SpeakerStream {
-        let sample_queue = Arc::new(Mutex::new(VecDeque::new()));
+        let rb = HeapRb::<f32>::new(RING_BUFFER_SAMPLES);
+        let (producer, consumer) = rb.split();
+        
         let waker_state = Arc::new(Mutex::new(WakerState {
             shutdown: false,
         }));
+        let data_ready = Arc::new((Mutex::new(false), Condvar::new()));
         let (init_tx, init_rx) = mpsc::channel();
 
-        let queue_clone = sample_queue.clone();
         let waker_clone = waker_state.clone();
+        let data_ready_clone = data_ready.clone();
         let device_id = self.device_id;
 
         let capture_thread = thread::spawn(move || {
-            if let Err(e) = Self::capture_audio_loop(queue_clone, waker_clone, init_tx, device_id) {
+            if let Err(e) = Self::capture_audio_loop(producer, waker_clone, data_ready_clone, init_tx, device_id) {
                 error!("Audio capture loop failed: {}", e);
             }
         });
@@ -112,16 +112,18 @@ impl SpeakerInput {
         };
 
         SpeakerStream {
-            sample_queue,
+            consumer: Some(consumer),
             waker_state,
             capture_thread: Some(capture_thread),
             actual_sample_rate,
+            data_ready,
         }
     }
 
     fn capture_audio_loop(
-        sample_queue: Arc<Mutex<VecDeque<f32>>>,
+        mut producer: HeapProd<f32>,
         waker_state: Arc<Mutex<WakerState>>,
+        data_ready: Arc<(Mutex<bool>, Condvar)>,
         init_tx: mpsc::Sender<Result<u32>>,
         device_id: Option<String>,
     ) -> Result<()> {
@@ -129,37 +131,35 @@ impl SpeakerInput {
             let device = match device_id {
                 Some(ref id) => match find_device_by_id(&Direction::Render, id) {
                     Some(d) => d,
-                    None => get_default_device(&Direction::Render).expect("No default render device"),
+                    None => get_default_device(&Direction::Render).map_err(|e| anyhow::anyhow!("{}", e)).expect("No default render device"),
                 },
-                None => get_default_device(&Direction::Render)?,
+                None => get_default_device(&Direction::Render).map_err(|e| anyhow::anyhow!("{}", e))?,
             };
 
-            let mut audio_client = device.get_iaudioclient()?;
-            let device_format = audio_client.get_mixformat()?;
+            let mut audio_client = device.get_iaudioclient().map_err(|e| anyhow::anyhow!("{}", e))?;
+            let device_format = audio_client.get_mixformat().map_err(|e| anyhow::anyhow!("{}", e))?;
             let actual_rate = device_format.get_samplespersec();
             let desired_format = WaveFormat::new(32, 32, &SampleType::Float, actual_rate as usize, 1, None);
 
-            let (_def_time, min_time) = audio_client.get_device_period()?;
-            let mode = StreamMode::EventsShared {
-                autoconvert: true,
-                buffer_duration_hns: min_time,
-            };
+            let (_def_time, min_time) = audio_client.get_periods().map_err(|e| anyhow::anyhow!("{}", e))?;
+            // For WASAPI loopback: device=Render, but initialize with Direction::Capture
+            // This triggers AUDCLNT_STREAMFLAGS_LOOPBACK flag in wasapi
+            audio_client.initialize_client(&desired_format, min_time, &Direction::Capture, &ShareMode::Shared, true).map_err(|e| anyhow::anyhow!("{}", e))?;
+            let h_event = audio_client.set_get_eventhandle().map_err(|e| anyhow::anyhow!("{}", e))?;
+            let render_client = audio_client.get_audiocaptureclient().map_err(|e| anyhow::anyhow!("{}", e))?;
+            audio_client.start_stream().map_err(|e| anyhow::anyhow!("{}", e))?;
 
-            audio_client.initialize_client(&desired_format, &Direction::Capture, &mode)?;
-            let h_event = audio_client.set_get_eventhandle()?;
-            let render_client = audio_client.get_audiocaptureclient()?;
-            audio_client.start_stream()?;
-
-            Ok((h_event, render_client, actual_rate))
+            Ok((h_event, render_client, actual_rate, audio_client))
         })();
 
         match init_result {
-            Ok((h_event, render_client, sample_rate)) => {
+            Ok((h_event, render_client, sample_rate, audio_client)) => {
                 let _ = init_tx.send(Ok(sample_rate));
                 loop {
                     {
                         let state = waker_state.lock().unwrap();
                         if state.shutdown {
+                            let _ = audio_client.stop_stream();
                             break;
                         }
                     }
@@ -170,7 +170,9 @@ impl SpeakerInput {
                     }
 
                     let mut temp_queue = VecDeque::new();
-                    if let Err(e) = render_client.read_from_device_to_deque(&mut temp_queue) {
+                    // bytes_per_frame for 32-bit float mono = 4 bytes
+                    let bytes_per_frame: usize = 4; // 32-bit float, 1 channel
+                    if let Err(e) = render_client.read_from_device_to_deque(bytes_per_frame, &mut temp_queue) {
                         error!("Failed to read audio data: {}", e);
                         continue;
                     }
@@ -179,7 +181,7 @@ impl SpeakerInput {
                         continue;
                     }
 
-                    let mut samples = Vec::new();
+                    let mut samples = Vec::with_capacity(temp_queue.len() / 4);
                     while temp_queue.len() >= 4 {
                         let bytes = [
                             temp_queue.pop_front().unwrap(),
@@ -192,13 +194,13 @@ impl SpeakerInput {
                     }
 
                     if !samples.is_empty() {
-                         let mut queue = sample_queue.lock().unwrap();
-                         let max_buffer_size = 131072; // 128KB
-                         queue.extend(samples.iter());
-                         if queue.len() > max_buffer_size {
-                             let to_drop = queue.len() - max_buffer_size;
-                             queue.drain(0..to_drop);
-                         }
+                        let _ = producer.push_slice(&samples);
+                        
+                        // Signal data ready
+                        let (lock, cvar) = &*data_ready;
+                        let mut ready = lock.lock().unwrap();
+                        *ready = true;
+                        cvar.notify_all();
                     }
                 }
             }
