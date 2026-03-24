@@ -14,54 +14,81 @@ pub fn get_hardware_id() -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Validates a Gumroad license key by calling the Gumroad Licenses API.
-/// Returns "OK" on success, or an error message string on failure.
-///
-/// Tries both the product_id and permalink to handle both old and new Gumroad products.
-#[napi]
-pub fn verify_gumroad_key(license_key: String) -> String {
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return format!("ERR:client:{}", e),
-    };
+use napi::bindgen_prelude::*;
+use napi::Task;
 
-    // Try both product identifiers (product_id for new products, permalink for old ones)
-    let product_ids = ["1HETxGKGYYf6DNDp5SnWVw==", "mzhzpt"];
-    let mut last_error = String::new();
+/// Background task that verifies a Gumroad license key via HTTP.
+/// Runs on a libuv worker thread — does NOT block the Node.js event loop.
+pub struct VerifyGumroadTask {
+    license_key: String,
+}
 
-    for pid in &product_ids {
-        let res = client
-            .post("https://api.gumroad.com/v2/licenses/verify")
-            .form(&[
-                ("product_id", *pid),
-                ("license_key", license_key.as_str()),
-                ("increment_uses_count", "true"),
-            ])
-            .send();
+impl Task for VerifyGumroadTask {
+    type Output = String;
+    type JsValue = String;
 
-        match res {
-            Ok(response) => {
-                let body = response.text().unwrap_or_else(|_| "no body".to_string());
-                println!("[LicenseRust] Gumroad response (pid={}): {}", pid, body);
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-                    if json["success"].as_bool().unwrap_or(false) {
-                        return "OK".to_string();
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|e| napi::Error::from_reason(format!("ERR:client:{}", e)))?;
+
+        // Try both product identifiers (product_id for new products, permalink for old ones)
+        let product_ids = ["1HETxGKGYYf6DNDp5SnWVw==", "mzhzpt"];
+        let mut last_error = String::new();
+
+        for (i, pid) in product_ids.iter().enumerate() {
+            // Only increment the use count on the canonical (first) attempt.
+            // Retry attempts against the legacy permalink should not double-count.
+            let increment = if i == 0 { "true" } else { "false" };
+
+            let res = client
+                .post("https://api.gumroad.com/v2/licenses/verify")
+                .form(&[
+                    ("product_id", *pid),
+                    ("license_key", self.license_key.as_str()),
+                    ("increment_uses_count", increment),
+                ])
+                .send();
+
+            match res {
+                Ok(response) => {
+                    let body = response.text().unwrap_or_else(|_| "no body".to_string());
+                    // Parse first, log only the success/error fields (never log the full body
+                    // as it may contain the license key in plaintext)
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                        let success = json["success"].as_bool().unwrap_or(false);
+                        let msg = json["message"].as_str().unwrap_or("");
+                        println!("[LicenseRust] Gumroad response (pid={}): success={}, msg={}", pid, success, msg);
+                        if success {
+                            return Ok("OK".to_string());
+                        }
+                        last_error = msg.to_string();
+                    } else {
+                        println!("[LicenseRust] Gumroad response (pid={}): parse error", pid);
+                        last_error = "parse error".to_string();
                     }
-                    last_error = json["message"].as_str().unwrap_or("unknown error").to_string();
-                } else {
-                    last_error = format!("parse error: {}", body);
+                }
+                Err(e) => {
+                    last_error = format!("network: {}", e);
                 }
             }
-            Err(e) => {
-                last_error = format!("network: {}", e);
-            }
         }
+
+        Ok(format!("ERR:gumroad:{}", last_error))
     }
 
-    format!("ERR:gumroad:{}", last_error)
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+/// Validates a Gumroad license key by calling the Gumroad Licenses API.
+/// Returns a Promise that resolves to "OK" on success, or an error message string on failure.
+/// The HTTP call runs on a libuv worker thread to prevent blocking the Node.js event loop.
+#[napi]
+pub fn verify_gumroad_key(license_key: String) -> AsyncTask<VerifyGumroadTask> {
+    AsyncTask::new(VerifyGumroadTask { license_key })
 }
 
 fn hostname_fallback() -> String {
