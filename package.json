@@ -4,12 +4,7 @@
     "main": "index.js",
     "types": "index.d.ts",
     "napi": {
-        "name": "index",
-        "triples": {
-            "defaults": true
-        }
-    },
-    "devDependencies": {
-        "@napi-rs/cli": "^2.18.4"
+        "binaryName": "index",
+        "targets": ["defaults"]
     }
 }

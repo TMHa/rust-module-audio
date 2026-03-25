@@ -16,7 +16,7 @@
 // - Hangover: Only affects AFTER speech ends (no latency impact)
 
 use std::time::{Duration, Instant};
-use webrtc_vad::{Vad, SampleRate as VadSampleRate, VadMode};
+use webrtc_vad::{SampleRate as VadSampleRate, Vad, VadMode};
 
 /// Configuration for silence suppression
 /// Optimized for low latency with adaptive threshold
@@ -24,11 +24,11 @@ pub struct SilenceSuppressionConfig {
     /// Initial RMS threshold for speech detection (i16 scale: 0-32767)
     /// Acts as starting value; adaptive tracking adjusts this over time.
     pub speech_threshold_rms: f32,
-    
+
     /// Duration to continue sending full audio after speech ends
     /// This does NOT add latency - only affects when we switch to keepalives
     pub speech_hangover: Duration,
-    
+
     /// How often to send a keepalive frame during silence
     pub silence_keepalive_interval: Duration,
 
@@ -73,7 +73,7 @@ impl SilenceSuppressionConfig {
             native_sample_rate: 48000,
         }
     }
-    
+
     /// Create config for microphone (standard)
     pub fn for_microphone() -> Self {
         Self {
@@ -161,7 +161,7 @@ impl SilenceSuppressor {
             was_speaking: true,
         }
     }
-    
+
     /// Process a frame and determine what to do with it.
     /// Returns (FrameAction, speech_just_ended)
     /// `speech_just_ended` is true on the exact frame where speech transitions to silence.
@@ -182,7 +182,7 @@ impl SilenceSuppressor {
         } else {
             false
         };
-        
+
         // ALWAYS check for speech first - immediate response
         if has_speech {
             self.state = SuppressionState::Active;
@@ -191,7 +191,7 @@ impl SilenceSuppressor {
             self.was_speaking = true;
             return (FrameAction::Send(frame.to_vec()), false);
         }
-        
+
         // No speech detected - check state
         let mut speech_just_ended = false;
         match self.state {
@@ -216,7 +216,7 @@ impl SilenceSuppressor {
                 // Already suppressed
             }
         }
-        
+
         // In suppressed state - update adaptive noise floor EMA
         // Only adapt during confirmed silence to avoid tracking speech levels
         let alpha = self.config.ema_alpha;
@@ -279,22 +279,25 @@ impl SilenceSuppressor {
             }
         }
     }
-    
+
     /// Get statistics
     pub fn stats(&self) -> (u64, u64) {
         (self.frames_sent, self.frames_suppressed)
     }
-    
+
     /// Get current state for UI
     pub fn is_speech(&self) -> bool {
-        matches!(self.state, SuppressionState::Active | SuppressionState::Hangover)
+        matches!(
+            self.state,
+            SuppressionState::Active | SuppressionState::Hangover
+        )
     }
 
     /// Get the current adaptive speech threshold
     pub fn adaptive_threshold(&self) -> f32 {
         self.adaptive_threshold
     }
-    
+
     /// Reset state (e.g., when meeting ends)
     pub fn reset(&mut self) {
         let now = Instant::now();
@@ -312,13 +315,14 @@ fn calculate_rms(samples: &[i16]) -> f32 {
     if samples.is_empty() {
         return 0.0;
     }
-    
+
     // Sample every 4th sample for speed (320/4 = 80 samples is plenty for RMS)
-    let sum_of_squares: f64 = samples.iter()
+    let sum_of_squares: f64 = samples
+        .iter()
         .step_by(4)
         .map(|&s| (s as f64) * (s as f64))
         .sum();
-    
+
     let count = (samples.len() + 3) / 4;
     (sum_of_squares / count as f64).sqrt() as f32
 }
@@ -331,22 +335,24 @@ pub fn generate_silence_frame(size: usize) -> Vec<i16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_speech_immediate() {
         let mut suppressor = SilenceSuppressor::new(SilenceSuppressionConfig {
             native_sample_rate: 16000, // Use 16kHz for test to avoid decimation issues
             ..SilenceSuppressionConfig::default()
         });
-        
+
         // Loud frame should be sent immediately (high amplitude sine-ish wave)
-        let loud_frame: Vec<i16> = (0..320).map(|i| ((i as f32 * 0.1).sin() * 10000.0) as i16).collect();
+        let loud_frame: Vec<i16> = (0..320)
+            .map(|i| ((i as f32 * 0.1).sin() * 10000.0) as i16)
+            .collect();
         let (action, ended) = suppressor.process(&loud_frame);
         assert!(matches!(action, FrameAction::Send(_)));
         assert!(!ended, "Speech should not have 'ended' on a loud frame");
         assert!(suppressor.is_speech());
     }
-    
+
     #[test]
     fn test_silence_keepalive() {
         let mut suppressor = SilenceSuppressor::new(SilenceSuppressionConfig {
@@ -358,10 +364,13 @@ mod tests {
             ema_alpha: 0.02,
             native_sample_rate: 16000,
         });
-        
+
         let silent_frame: Vec<i16> = vec![0; 320];
         let (action, _ended) = suppressor.process(&silent_frame);
-        assert!(matches!(action, FrameAction::SendSilence | FrameAction::Suppress));
+        assert!(matches!(
+            action,
+            FrameAction::SendSilence | FrameAction::Suppress
+        ));
     }
 
     #[test]
@@ -377,7 +386,9 @@ mod tests {
         });
 
         // Send a loud speech-like frame
-        let loud_frame: Vec<i16> = (0..320).map(|i| ((i as f32 * 0.1).sin() * 10000.0) as i16).collect();
+        let loud_frame: Vec<i16> = (0..320)
+            .map(|i| ((i as f32 * 0.1).sin() * 10000.0) as i16)
+            .collect();
         let (_, ended) = suppressor.process(&loud_frame);
         assert!(!ended, "Speech should not end on a loud frame");
 

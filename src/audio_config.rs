@@ -19,8 +19,8 @@ pub const CHUNK_SAMPLES: usize = FRAME_SAMPLES;
 
 /// VAD thresholds (for UI display only - does NOT gate STT audio)
 /// These match the Swift implementation values
-pub const VAD_START_RMS: f32 = 185.0;  // Speech start threshold (~-45dBFS)
-pub const VAD_END_RMS: f32 = 100.0;    // Speech end threshold (~-50dBFS)
+pub const VAD_START_RMS: f32 = 185.0; // Speech start threshold (~-45dBFS)
+pub const VAD_END_RMS: f32 = 100.0; // Speech end threshold (~-50dBFS)
 
 /// VAD preroll chunks to include before speech detection
 pub const VAD_PREROLL_CHUNKS: usize = 3;
