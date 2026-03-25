@@ -6,5 +6,8 @@
     "napi": {
         "binaryName": "index",
         "targets": ["defaults"]
+    },
+    "devDependencies": {
+        "@napi-rs/cli": "^3.5.2"
     }
 }
