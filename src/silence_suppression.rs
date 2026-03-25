@@ -64,12 +64,12 @@ impl SilenceSuppressionConfig {
     /// Create config for system audio (very permissive - system audio is quieter)
     pub fn for_system_audio() -> Self {
         Self {
-            speech_threshold_rms: 30.0,
-            speech_hangover: Duration::from_millis(300),
+            speech_threshold_rms: 15.0,  // Lowered from 30.0 to catch quieter system audio
+            speech_hangover: Duration::from_millis(500),  // Longer hangover for natural speech pauses
             silence_keepalive_interval: Duration::from_millis(100),
-            adaptive_multiplier: 3.0,
-            adaptive_min_floor: 10.0,
-            ema_alpha: 0.02,
+            adaptive_multiplier: 2.0,  // Lower multiplier = more permissive (was 3.0)
+            adaptive_min_floor: 5.0,     // Lowered from 10.0 to catch faint audio
+            ema_alpha: 0.05,             // Faster adaptation to changing noise levels
             native_sample_rate: 48000,
         }
     }
@@ -134,11 +134,12 @@ impl SilenceSuppressor {
         let initial_threshold = config.speech_threshold_rms;
         let decimation_factor = config.native_sample_rate as f64 / 16000.0;
 
-        let vad = Vad::new_with_rate_and_mode(VadSampleRate::Rate16kHz, VadMode::Aggressive);
+        // Use Normal VAD mode for better speech detection (Aggressive was too restrictive)
+        let vad = Vad::new_with_rate_and_mode(VadSampleRate::Rate16kHz, VadMode::Normal);
 
         println!(
             "[SilenceSuppressor] Created: threshold={} (adaptive), hangover={}ms, \
-             keepalive={}ms, native_rate={}Hz, decimation={:.2}x, VAD=Aggressive",
+             keepalive={}ms, native_rate={}Hz, decimation={:.2}x, VAD=Normal",
             config.speech_threshold_rms,
             config.speech_hangover.as_millis(),
             config.silence_keepalive_interval.as_millis(),
