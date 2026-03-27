@@ -1,0 +1,66 @@
+name: Build Native Module
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'native-module/**'
+  pull_request:
+    paths:
+      - 'native-module/**'
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            native-module/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('native-module/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build native module (x64)
+        working-directory: native-module
+        run: npx napi build --platform --target x86_64-apple-darwin --release
+
+      - name: Build native module (arm64)
+        working-directory: native-module
+        run: npx napi build --platform --target aarch64-apple-darwin --release
+
+      - name: Verify artifacts
+        run: |
+          echo "Built artifacts:"
+          ls -la native-module/*.node
+
+      - name: Upload native artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-module-macos
+          path: |
+            native-module/index.darwin-x64.node
+            native-module/index.darwin-arm64.node
+          retention-days: 30
