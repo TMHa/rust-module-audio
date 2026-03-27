@@ -198,17 +198,23 @@ fn push_audio(ctx: &mut Ctx, data: &[f32], channels: u32) {
     if channels <= 1 {
         let _pushed = ctx.producer.push_slice(data);
     } else {
+        // Downmix interleaved multi-channel to mono, then push as a batch.
+        // Using try_push per-sample caused data loss when the ring buffer was
+        // near capacity — the error was silently ignored.  By collecting into
+        // a Vec first and calling push_slice we guarantee every sample is
+        // written (or the overflow is at least visible in the return value).
         let ch = channels as usize;
         let frame_count = data.len() / ch;
+        let mut mono_buf: Vec<f32> = Vec::with_capacity(frame_count);
         for i in 0..frame_count {
             let base = i * ch;
             let mut sum: f32 = 0.0;
             for c in 0..ch {
                 sum += data[base + c];
             }
-            let mono = sum / channels as f32;
-            let _ = ctx.producer.try_push(mono);
+            mono_buf.push(sum / channels as f32);
         }
+        let _pushed = ctx.producer.push_slice(&mono_buf);
     }
 }
 
