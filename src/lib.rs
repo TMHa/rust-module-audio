@@ -91,7 +91,7 @@ impl LinearResampler {
                 input[input.len() - 1]
             };
             let interpolated = sample_a + (sample_b - sample_a) * (frac as f32);
-            let scaled = (interpolated * 32767.0).clamp(-32768.0, 32767);
+            let scaled = (interpolated * 32767.0).clamp(-32768.0, 32767.0);
             output.push(scaled as i16);
             self.fractional_pos += self.ratio;
         }
@@ -230,20 +230,20 @@ impl SystemAudioCapture {
                 while frame_buffer.len() >= chunk_size {
                     let frame: Vec<i16> = frame_buffer.drain(0..chunk_size).collect();
                     match suppressor.process(&frame) {
-                        FrameAction::Send(data) => {
+                        (FrameAction::Send(data), _) => {
                             tsfn.call(
                                 Ok(Buffer::from(i16_slice_to_le_bytes(&data))),
                                 ThreadsafeFunctionCallMode::NonBlocking,
                             );
                         }
-                        FrameAction::SendSilence => {
+                        (FrameAction::SendSilence, _) => {
                             let silence = vec![0u8; chunk_size * 2];
                             tsfn.call(
                                 Ok(Buffer::from(silence)),
                                 ThreadsafeFunctionCallMode::NonBlocking,
                             );
                         }
-                        FrameAction::Suppress => {
+                        (FrameAction::Suppress, _) => {
                             // Bandwidth saving
                         }
                     }

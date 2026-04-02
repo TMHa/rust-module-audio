@@ -69,17 +69,20 @@ impl Default for SilenceSuppressionConfig {
 }
 
 impl SilenceSuppressionConfig {
-    /// Create config for system audio (very permissive - system audio is quieter, VAD disabled)
+    /// Create config for system audio: DISABLE all suppression, send ALL audio.
+    /// v2.0.3 worked because it sent ALL audio through STT. The only gate
+    /// was RMS threshold=30, but since suppression was adaptive, quiet speaker
+    /// audio could still get suppressed. For system audio, we want NO suppression.
     pub fn for_system_audio() -> Self {
         Self {
-            speech_threshold_rms: 15.0,  // Lowered from 30 to catch quiet speaker audio
-            speech_hangover: Duration::from_millis(300),
-            silence_keepalive_interval: Duration::from_millis(100),
-            adaptive_multiplier: 2.5,    // Reduced from 3.0 for faster adaptation
-            adaptive_min_floor: 5.0,     // Lowered from 10.0 — don't suppress quiet speaker audio
-            ema_alpha: 0.01,             // Slower adaptation — keeps threshold low longer
+            speech_threshold_rms: 1.0,       //极低: detect ANY non-silence
+            speech_hangover: Duration::from_secs(3600), // Never enter hangover
+            silence_keepalive_interval: Duration::from_secs(3600), // Never send keepalives
+            adaptive_multiplier: 1.001,       // Never adapt upward
+            adaptive_min_floor: 0.5,          //极低 floor
+            ema_alpha: 0.001,                 // Very slow adaptation
             native_sample_rate: 48000,
-            use_vad: false, // VAD rejects speaker audio — use RMS-only like v2.0.3
+            use_vad: false,
         }
     }
 
