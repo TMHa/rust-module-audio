@@ -1,9 +1,12 @@
 use anyhow::Result;
+use ca::aggregate_device_keys as agg_keys;
 use cidre::{arc, av, cat, cf, core_audio as ca, ns, os};
-use ringbuf::{traits::{Producer, Split}, HeapProd, HeapRb, HeapCons};
+use ringbuf::{
+    traits::{Producer, Split},
+    HeapCons, HeapProd, HeapRb,
+};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use ca::aggregate_device_keys as agg_keys;
 
 struct Ctx {
     format: arc::R<av::AudioFormat>,
@@ -13,7 +16,7 @@ struct Ctx {
 }
 
 pub struct SpeakerInput {
-    tap: ca::TapGuard, 
+    tap: ca::TapGuard,
     device: Option<ca::hardware::StartedDevice<ca::AggregateDevice>>,
     _ctx: Box<Ctx>,
     consumer: Option<HeapCons<f32>>,
@@ -25,10 +28,11 @@ impl SpeakerInput {
         // 1. Find the target output device
         let output_device = match device_id {
             Some(ref uid) if !uid.is_empty() && uid != "default" => {
-                 let devices = ca::System::devices()?;
-                 devices.into_iter().find(|d| {
-                     d.uid().map(|u| u.to_string() == *uid).unwrap_or(false)
-                 }).unwrap_or(ca::System::default_output_device()?)
+                let devices = ca::System::devices()?;
+                devices
+                    .into_iter()
+                    .find(|d| d.uid().map(|u| u.to_string() == *uid).unwrap_or(false))
+                    .unwrap_or(ca::System::default_output_device()?)
             }
             _ => ca::System::default_output_device()?,
         };
@@ -83,10 +87,15 @@ impl SpeakerInput {
             ],
         );
 
-        let asbd = tap.asbd().map_err(|_| anyhow::anyhow!("Failed to get ASBD from tap"))?;
+        let asbd = tap
+            .asbd()
+            .map_err(|_| anyhow::anyhow!("Failed to get ASBD from tap"))?;
         let format = av::AudioFormat::with_asbd(&asbd).unwrap();
         let channels = asbd.channels_per_frame;
-        println!("[CoreAudioTap] Format: {}Hz, {}ch", asbd.sample_rate, channels);
+        println!(
+            "[CoreAudioTap] Format: {}Hz, {}ch",
+            asbd.sample_rate, channels
+        );
 
         let buffer_size = 1024 * 128;
         let rb = HeapRb::<f32>::new(buffer_size);
@@ -102,7 +111,7 @@ impl SpeakerInput {
         });
 
         let agg_device = ca::AggregateDevice::with_desc(&agg_desc)?;
-        
+
         let proc_id = agg_device.create_io_proc_id(proc, Some(&mut *ctx))?;
         let started_device = ca::device_start(agg_device, Some(proc_id))?;
         println!("[CoreAudioTap] Aggregate device started successfully");
@@ -149,13 +158,15 @@ extern "C" fn proc(
 
     let _channels = ctx.channels;
 
-    if let Some(view) =
-        av::AudioPcmBuf::with_buf_list_no_copy(&ctx.format, input_data, None)
-    {
+    if let Some(view) = av::AudioPcmBuf::with_buf_list_no_copy(&ctx.format, input_data, None) {
         if let Some(data) = view.data_f32_at(0) {
-             let buffer_channels = input_data.buffers[0].number_channels;
-             let actual_ch = if buffer_channels > 1 { buffer_channels } else { 2 };
-             push_audio(ctx, data, actual_ch);
+            let buffer_channels = input_data.buffers[0].number_channels;
+            let actual_ch = if buffer_channels > 1 {
+                buffer_channels
+            } else {
+                2
+            };
+            push_audio(ctx, data, actual_ch);
         }
     } else if ctx.format.common_format() == av::audio::CommonFormat::PcmF32 {
         let first_buffer = &input_data.buffers[0];
@@ -163,15 +174,18 @@ extern "C" fn proc(
         let float_count = byte_count / std::mem::size_of::<f32>();
 
         if float_count > 0 && !first_buffer.data.is_null() {
-            let data = unsafe {
-                std::slice::from_raw_parts(first_buffer.data as *const f32, float_count)
-            };
-            
-            // BUGFIX: macOS CoreAudio Tap notoriously ignores mono ASBD requests 
+            let data =
+                unsafe { std::slice::from_raw_parts(first_buffer.data as *const f32, float_count) };
+
+            // BUGFIX: macOS CoreAudio Tap notoriously ignores mono ASBD requests
             // and secretly returns interleaved stereo (L,R,L,R).
             let buffer_channels = first_buffer.number_channels;
-            let actual_ch = if buffer_channels > 1 { buffer_channels } else { 2 };
-            
+            let actual_ch = if buffer_channels > 1 {
+                buffer_channels
+            } else {
+                2
+            };
+
             push_audio(ctx, data, actual_ch);
         }
     }

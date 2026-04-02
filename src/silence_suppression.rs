@@ -16,7 +16,7 @@
 // - Hangover: Only affects AFTER speech ends (no latency impact)
 
 use std::time::{Duration, Instant};
-use webrtc_vad::{Vad, SampleRate as VadSampleRate, VadMode};
+use webrtc_vad::{SampleRate as VadSampleRate, Vad, VadMode};
 
 /// Configuration for silence suppression
 /// Optimized for low latency with adaptive threshold
@@ -24,11 +24,11 @@ pub struct SilenceSuppressionConfig {
     /// Initial RMS threshold for speech detection (i16 scale: 0-32767)
     /// Acts as starting value; adaptive tracking adjusts this over time.
     pub speech_threshold_rms: f32,
-    
+
     /// Duration to continue sending full audio after speech ends
     /// This does NOT add latency - only affects when we switch to keepalives
     pub speech_hangover: Duration,
-    
+
     /// How often to send a keepalive frame during silence
     pub silence_keepalive_interval: Duration,
 
@@ -44,6 +44,13 @@ pub struct SilenceSuppressionConfig {
     /// Native sample rate of the audio being processed (e.g. 48000)
     /// Used to calculate decimation ratio for 16kHz VAD input.
     pub native_sample_rate: u32,
+
+    /// Whether to run WebRTC VAD check (Stage 2 of two-stage gate).
+    /// Set to `false` for system audio capture — VAD rejects speaker audio
+    /// because the timbre changes (EQ, room echo, compression), causing
+    /// transcript to miss real speech. With VAD off, RMS-only suppression
+    /// behaves like v2.0.3.
+    pub use_vad: bool,
 }
 
 impl Default for SilenceSuppressionConfig {
@@ -56,12 +63,13 @@ impl Default for SilenceSuppressionConfig {
             adaptive_min_floor: 20.0,
             ema_alpha: 0.02,
             native_sample_rate: 48000,
+            use_vad: true,
         }
     }
 }
 
 impl SilenceSuppressionConfig {
-    /// Create config for system audio (very permissive - system audio is quieter)
+    /// Create config for system audio (very permissive - system audio is quieter, VAD disabled)
     pub fn for_system_audio() -> Self {
         Self {
             speech_threshold_rms: 30.0,
@@ -71,9 +79,10 @@ impl SilenceSuppressionConfig {
             adaptive_min_floor: 10.0,
             ema_alpha: 0.02,
             native_sample_rate: 48000,
+            use_vad: false, // VAD rejects speaker audio — use RMS-only like v2.0.3
         }
     }
-    
+
     /// Create config for microphone (standard)
     pub fn for_microphone() -> Self {
         Self {
@@ -84,11 +93,12 @@ impl SilenceSuppressionConfig {
             adaptive_min_floor: 20.0,
             ema_alpha: 0.02,
             native_sample_rate: 48000,
+            use_vad: true,
         }
     }
 }
 
-/// Silence suppression state machine with adaptive threshold + WebRTC VAD
+/// Silence suppression state machine with adaptive threshold + optional WebRTC VAD
 pub struct SilenceSuppressor {
     config: SilenceSuppressionConfig,
     state: SuppressionState,
@@ -102,8 +112,8 @@ pub struct SilenceSuppressor {
     adaptive_threshold: f32,
     /// Tracks whether we were speaking in the previous frame (for edge detection)
     was_speaking: bool,
-    /// WebRTC Voice Activity Detector (ML-based, 16kHz)
-    vad: Vad,
+    /// WebRTC Voice Activity Detector (ML-based, 16kHz) — only created when `use_vad` is true
+    vad: Option<Vad>,
     /// Decimation factor: native_sample_rate / 16000 (may be non-integer, e.g. 44100/16000 = 2.75625)
     decimation_factor: f64,
     /// Reusable buffer for decimated 16kHz samples (avoids allocation per frame)
@@ -134,16 +144,28 @@ impl SilenceSuppressor {
         let initial_threshold = config.speech_threshold_rms;
         let decimation_factor = config.native_sample_rate as f64 / 16000.0;
 
-        let vad = Vad::new_with_rate_and_mode(VadSampleRate::Rate16kHz, VadMode::Aggressive);
+        let vad = if config.use_vad {
+            Some(Vad::new_with_rate_and_mode(
+                VadSampleRate::Rate16kHz,
+                VadMode::Aggressive,
+            ))
+        } else {
+            None
+        };
 
         println!(
             "[SilenceSuppressor] Created: threshold={} (adaptive), hangover={}ms, \
-             keepalive={}ms, native_rate={}Hz, decimation={:.2}x, VAD=Aggressive",
+             keepalive={}ms, native_rate={}Hz, decimation={:.2}x, VAD={}",
             config.speech_threshold_rms,
             config.speech_hangover.as_millis(),
             config.silence_keepalive_interval.as_millis(),
             config.native_sample_rate,
             decimation_factor,
+            if config.use_vad {
+                "Aggressive"
+            } else {
+                "Off (RMS-only)"
+            },
         );
 
         Self {
@@ -161,7 +183,7 @@ impl SilenceSuppressor {
             was_speaking: true,
         }
     }
-    
+
     /// Process a frame and determine what to do with it.
     /// Returns (FrameAction, speech_just_ended)
     /// `speech_just_ended` is true on the exact frame where speech transitions to silence.
@@ -182,7 +204,7 @@ impl SilenceSuppressor {
         } else {
             false
         };
-        
+
         // ALWAYS check for speech first - immediate response
         if has_speech {
             self.state = SuppressionState::Active;
@@ -191,7 +213,7 @@ impl SilenceSuppressor {
             self.was_speaking = true;
             return (FrameAction::Send(frame.to_vec()), false);
         }
-        
+
         // No speech detected - check state
         let mut speech_just_ended = false;
         match self.state {
@@ -216,7 +238,7 @@ impl SilenceSuppressor {
                 // Already suppressed
             }
         }
-        
+
         // In suppressed state - update adaptive noise floor EMA
         // Only adapt during confirmed silence to avoid tracking speech levels
         let alpha = self.config.ema_alpha;
@@ -239,8 +261,18 @@ impl SilenceSuppressor {
     /// WebRTC VAD requires exactly 160/320/480 samples at 16kHz (10/20/30ms).
     /// We dynamically choose the closest valid frame size based on the actual
     /// decimated sample count, handling non-integer ratios (e.g. 44.1kHz).
+    /// Returns `true` (voice detected) when VAD is disabled or frame too small.
     #[inline]
-    fn is_voice(&mut self, frame: &[i16]) -> bool {
+    fn is_voice(&self, frame: &[i16]) -> bool {
+        // When VAD is disabled (system audio), trust RMS-only detection
+        if !self.config.use_vad {
+            return true;
+        }
+        let vad = match &self.vad {
+            Some(v) => v,
+            None => return true,
+        };
+
         self.vad_buf.clear();
 
         // Decimate: take samples at 16kHz intervals using floating-point stepping.
@@ -271,7 +303,7 @@ impl SilenceSuppressor {
             return true;
         };
 
-        match self.vad.is_voice_segment(&self.vad_buf[..target]) {
+        match vad.is_voice_segment(&self.vad_buf[..target]) {
             Ok(is_voice) => is_voice,
             Err(_) => {
                 // On VAD error, fall back to RMS-only (don't block audio)
@@ -279,22 +311,25 @@ impl SilenceSuppressor {
             }
         }
     }
-    
+
     /// Get statistics
     pub fn stats(&self) -> (u64, u64) {
         (self.frames_sent, self.frames_suppressed)
     }
-    
+
     /// Get current state for UI
     pub fn is_speech(&self) -> bool {
-        matches!(self.state, SuppressionState::Active | SuppressionState::Hangover)
+        matches!(
+            self.state,
+            SuppressionState::Active | SuppressionState::Hangover
+        )
     }
 
     /// Get the current adaptive speech threshold
     pub fn adaptive_threshold(&self) -> f32 {
         self.adaptive_threshold
     }
-    
+
     /// Reset state (e.g., when meeting ends)
     pub fn reset(&mut self) {
         let now = Instant::now();
@@ -312,13 +347,14 @@ fn calculate_rms(samples: &[i16]) -> f32 {
     if samples.is_empty() {
         return 0.0;
     }
-    
+
     // Sample every 4th sample for speed (320/4 = 80 samples is plenty for RMS)
-    let sum_of_squares: f64 = samples.iter()
+    let sum_of_squares: f64 = samples
+        .iter()
         .step_by(4)
         .map(|&s| (s as f64) * (s as f64))
         .sum();
-    
+
     let count = (samples.len() + 3) / 4;
     (sum_of_squares / count as f64).sqrt() as f32
 }
@@ -331,22 +367,24 @@ pub fn generate_silence_frame(size: usize) -> Vec<i16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_speech_immediate() {
         let mut suppressor = SilenceSuppressor::new(SilenceSuppressionConfig {
             native_sample_rate: 16000, // Use 16kHz for test to avoid decimation issues
             ..SilenceSuppressionConfig::default()
         });
-        
+
         // Loud frame should be sent immediately (high amplitude sine-ish wave)
-        let loud_frame: Vec<i16> = (0..320).map(|i| ((i as f32 * 0.1).sin() * 10000.0) as i16).collect();
+        let loud_frame: Vec<i16> = (0..320)
+            .map(|i| ((i as f32 * 0.1).sin() * 10000.0) as i16)
+            .collect();
         let (action, ended) = suppressor.process(&loud_frame);
         assert!(matches!(action, FrameAction::Send(_)));
         assert!(!ended, "Speech should not have 'ended' on a loud frame");
         assert!(suppressor.is_speech());
     }
-    
+
     #[test]
     fn test_silence_keepalive() {
         let mut suppressor = SilenceSuppressor::new(SilenceSuppressionConfig {
@@ -357,11 +395,15 @@ mod tests {
             adaptive_min_floor: 20.0,
             ema_alpha: 0.02,
             native_sample_rate: 16000,
+            use_vad: true,
         });
-        
+
         let silent_frame: Vec<i16> = vec![0; 320];
         let (action, _ended) = suppressor.process(&silent_frame);
-        assert!(matches!(action, FrameAction::SendSilence | FrameAction::Suppress));
+        assert!(matches!(
+            action,
+            FrameAction::SendSilence | FrameAction::Suppress
+        ));
     }
 
     #[test]
@@ -374,10 +416,13 @@ mod tests {
             adaptive_min_floor: 20.0,
             ema_alpha: 0.02,
             native_sample_rate: 16000,
+            use_vad: true,
         });
 
         // Send a loud speech-like frame
-        let loud_frame: Vec<i16> = (0..320).map(|i| ((i as f32 * 0.1).sin() * 10000.0) as i16).collect();
+        let loud_frame: Vec<i16> = (0..320)
+            .map(|i| ((i as f32 * 0.1).sin() * 10000.0) as i16)
+            .collect();
         let (_, ended) = suppressor.process(&loud_frame);
         assert!(!ended, "Speech should not end on a loud frame");
 
