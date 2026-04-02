@@ -17,6 +17,9 @@ struct Ctx {
 
 pub struct SpeakerInput {
     tap: ca::TapGuard,
+    /// CRITICAL: Keep agg_desc alive! If dropped, CoreAudio aggregate device
+    /// stops feeding data into the ring buffer after ~40s (observed regression from v2.0.3).
+    agg_desc: arc::R<cf::DictionaryOf<cf::String, cf::Type>>,
     device: Option<ca::hardware::StartedDevice<ca::AggregateDevice>>,
     _ctx: Box<Ctx>,
     consumer: Option<HeapCons<f32>>,
@@ -118,8 +121,11 @@ impl SpeakerInput {
 
         // We now return the fully started device inside Ok.
         // If anything above fails, it yields an Err(), triggering SCK fallback smoothly!
+        // CRITICAL: Store agg_desc so it doesn't get dropped. If dropped, CoreAudio
+        // aggregate device stops feeding data after ~40s (regression from v2.0.3).
         Ok(Self {
             tap,
+            agg_desc,
             device: Some(started_device),
             _ctx: ctx,
             consumer: Some(consumer),
@@ -131,6 +137,7 @@ impl SpeakerInput {
         SpeakerStream {
             consumer: self.consumer,
             _device: self.device,
+            _agg_desc: self.agg_desc,
             _ctx: self._ctx,
             _tap: self.tap,
             current_sample_rate: self.current_sample_rate,
@@ -215,6 +222,8 @@ fn push_audio(ctx: &mut Ctx, data: &[f32], channels: u32) {
 pub struct SpeakerStream {
     consumer: Option<HeapCons<f32>>,
     _device: Option<ca::hardware::StartedDevice<ca::AggregateDevice>>,
+    /// CRITICAL: Keep agg_desc alive so CoreAudio tap keeps feeding data.
+    _agg_desc: arc::R<cf::DictionaryOf<cf::String, cf::Type>>,
     _ctx: Box<Ctx>,
     _tap: ca::TapGuard,
     current_sample_rate: Arc<AtomicU32>,

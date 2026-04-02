@@ -76,8 +76,8 @@ impl SilenceSuppressionConfig {
     pub fn for_system_audio() -> Self {
         Self {
             speech_threshold_rms: 1.0,       //极低: detect ANY non-silence
-            speech_hangover: Duration::from_secs(3600), // Never enter hangover
-            silence_keepalive_interval: Duration::from_secs(3600), // Never send keepalives
+            speech_hangover: Duration::from_millis(200), // Short hangover for smooth transitions
+            silence_keepalive_interval: Duration::from_millis(100), // Regular keepalives to maintain connection
             adaptive_multiplier: 1.001,       // Never adapt upward
             adaptive_min_floor: 0.5,          //极低 floor
             ema_alpha: 0.001,                 // Very slow adaptation
