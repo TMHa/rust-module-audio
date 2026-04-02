@@ -263,12 +263,12 @@ impl SilenceSuppressor {
     /// decimated sample count, handling non-integer ratios (e.g. 44.1kHz).
     /// Returns `true` (voice detected) when VAD is disabled or frame too small.
     #[inline]
-    fn is_voice(&self, frame: &[i16]) -> bool {
+    fn is_voice(&mut self, frame: &[i16]) -> bool {
         // When VAD is disabled (system audio), trust RMS-only detection
         if !self.config.use_vad {
             return true;
         }
-        let vad = match &self.vad {
+        let vad = match &mut self.vad {
             Some(v) => v,
             None => return true,
         };
