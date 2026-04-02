@@ -42,6 +42,68 @@ fn is_all_silence(samples: &[i16]) -> bool {
 }
 
 // ============================================================================
+// LINEAR RESAMPLER (matches v2.0.3 StreamingResampler behavior)
+// Resamples f32 native-rate audio → i16 at 16kHz output for STT
+// ============================================================================
+
+struct LinearResampler {
+    ratio: f64,
+    fractional_pos: f64,
+    prev_sample: f32,
+    initialized: bool,
+}
+
+impl LinearResampler {
+    fn new(input_sample_rate: f64) -> Self {
+        Self {
+            ratio: input_sample_rate / 16000.0,
+            fractional_pos: 0.0,
+            prev_sample: 0.0,
+            initialized: false,
+        }
+    }
+
+    /// Resample f32 native-rate input → i16 at 16kHz output.
+    /// Maintains state across calls for seamless streaming.
+    fn resample(&mut self, input: &[f32]) -> Vec<i16> {
+        if input.is_empty() {
+            return Vec::new();
+        }
+        let mut output = Vec::with_capacity(((input.len() as f64 / self.ratio) + 2.0) as usize);
+        if !self.initialized {
+            self.prev_sample = input[0];
+            self.initialized = true;
+        }
+        while self.fractional_pos < input.len() as f64 {
+            let pos = self.fractional_pos;
+            let idx = pos.floor() as usize;
+            let frac = pos - idx as f64;
+            let sample_a = if idx == 0 && frac < 0.001 {
+                self.prev_sample
+            } else if idx < input.len() {
+                input[idx]
+            } else {
+                break;
+            };
+            let sample_b = if idx + 1 < input.len() {
+                input[idx + 1]
+            } else {
+                input[input.len() - 1]
+            };
+            let interpolated = sample_a + (sample_b - sample_a) * (frac as f32);
+            let scaled = (interpolated * 32767.0).clamp(-32768.0, 32767);
+            output.push(scaled as i16);
+            self.fractional_pos += self.ratio;
+        }
+        if self.fractional_pos >= input.len() as f64 {
+            self.prev_sample = input[input.len() - 1];
+            self.fractional_pos -= input.len() as f64;
+        }
+        output
+    }
+}
+
+// ============================================================================
 // SYSTEM AUDIO CAPTURE (CoreAudio Tap / ScreenCaptureKit on macOS)
 // ============================================================================
 
@@ -131,61 +193,50 @@ impl SystemAudioCapture {
                 native_rate
             );
 
-            // 2. DSP loop with silence suppression + WebRTC VAD
+            // 2. DSP loop with silence suppression
+            // Re-add resampling from native_rate → 16kHz like v2.0.3
+            let mut resampler = LinearResampler::new(native_rate as f64);
             let mut suppressor = SilenceSuppressor::new(SilenceSuppressionConfig {
-                native_sample_rate: native_rate,
+                native_sample_rate: 16000, // 16kHz after resampling
                 ..SilenceSuppressionConfig::for_system_audio()
             });
 
-            // 20ms chunks at native rate (e.g. 960 samples at 48kHz)
-            let chunk_size = (native_rate as usize / 1000) * 20;
+            // 20ms chunks at 16kHz = 320 samples
+            let chunk_size = 320;
             let mut frame_buffer: Vec<i16> = Vec::with_capacity(chunk_size * 4);
             let mut raw_batch: Vec<f32> = Vec::with_capacity(4096);
-            // Track consecutive silence-only frames to detect CoreAudio Tap starvation
-            let mut consec_silence_chunks: u32 = 0;
 
             loop {
                 if stop_signal.load(Ordering::Relaxed) {
                     break;
                 }
 
-                // Drain ALL available samples from ring buffer (lock-free)
+                // Drain ring buffer
                 while let Some(sample) = consumer.try_pop() {
                     raw_batch.push(sample);
-                }
-
-                // Convert f32 -> i16 at native sample rate
-                if !raw_batch.is_empty() {
-                    for &f in &raw_batch {
-                        let scaled = (f * 32767.0).clamp(-32768.0, 32767.0);
-                        frame_buffer.push(scaled as i16);
+                    if raw_batch.len() >= 480 {
+                        break;
                     }
-                    raw_batch.clear();
-                    // Reset silence counter when we actually get data
-                    consec_silence_chunks = 0;
                 }
 
-                // Process in 20ms chunks through the two-stage gate
+                // Resample f32 native-rate → i16 at 16kHz
+                if !raw_batch.is_empty() {
+                    let resampled = resampler.resample(&raw_batch);
+                    frame_buffer.extend(resampled);
+                    raw_batch.clear();
+                }
+
+                // Process frames with Silence Suppression (RMS-only, VAD disabled)
                 while frame_buffer.len() >= chunk_size {
                     let frame: Vec<i16> = frame_buffer.drain(0..chunk_size).collect();
-
-                    let (action, speech_ended) = suppressor.process(&frame);
-
-                    match action {
+                    match suppressor.process(&frame) {
                         FrameAction::Send(data) => {
-                            let bytes = i16_slice_to_le_bytes(&data);
-                            if is_all_silence(&data) {
-                                consec_silence_chunks += 1;
-                            } else {
-                                consec_silence_chunks = 0;
-                            }
                             tsfn.call(
-                                Ok(Buffer::from(bytes)),
+                                Ok(Buffer::from(i16_slice_to_le_bytes(&data))),
                                 ThreadsafeFunctionCallMode::NonBlocking,
                             );
                         }
                         FrameAction::SendSilence => {
-                            // Send zero-filled buffer to keep streaming APIs alive
                             let silence = vec![0u8; chunk_size * 2];
                             tsfn.call(
                                 Ok(Buffer::from(silence)),
@@ -193,28 +244,15 @@ impl SystemAudioCapture {
                             );
                         }
                         FrameAction::Suppress => {
-                            // Do nothing — bandwidth saving
-                        }
-                    }
-
-                    // Fire speech_ended callback on the exact transition frame
-                    if speech_ended {
-                        if let Some(ref se_tsfn) = speech_ended_tsfn {
-                            se_tsfn.call(Ok(true), ThreadsafeFunctionCallMode::NonBlocking);
+                            // Bandwidth saving
                         }
                     }
                 }
 
-                // Log if CoreAudio Tap is starving (sending consecutive zero-data chunks)
-                if consec_silence_chunks > 0 && consec_silence_chunks % 100 == 0 {
-                    eprintln!(
-                        "[SystemAudioCapture] WARNING: {} consecutive silence chunks from ring buffer",
-                        consec_silence_chunks
-                    );
+                // Short sleep
+                if frame_buffer.len() < chunk_size {
+                    thread::sleep(Duration::from_millis(DSP_POLL_MS));
                 }
-
-                // Keep the sleep small so we quickly read the ring buffer
-                thread::sleep(Duration::from_millis(DSP_POLL_MS));
             }
 
             println!("[SystemAudioCapture] DSP thread stopped.");
