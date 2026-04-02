@@ -343,7 +343,7 @@ impl SilenceSuppressor {
 }
 
 /// Calculate RMS of i16 samples efficiently
-fn calculate_rms(samples: &[i16]) -> f32 {
+pub fn calculate_rms(samples: &[i16]) -> f32 {
     if samples.is_empty() {
         return 0.0;
     }
