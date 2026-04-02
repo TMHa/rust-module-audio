@@ -7,7 +7,7 @@
         "build": "napi build"
     },
     "devDependencies": {
-        "@napi-rs/cli": "^2.18.0"
+        "@napi-rs/cli": "^3.0.0"
     },
     "napi": {
         "binaryName": "index",
