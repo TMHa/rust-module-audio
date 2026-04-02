@@ -19,14 +19,13 @@ pub mod silence_suppression;
 pub mod speaker;
 
 use crate::audio_config::DSP_POLL_MS;
-use crate::silence_suppression::{calculate_rms, FrameAction, SilenceSuppressionConfig, SilenceSuppressor};
+use crate::silence_suppression::{FrameAction, SilenceSuppressionConfig, SilenceSuppressor};
 
 // ============================================================================
-// HELPERS — i16 slice → zero-copy LE bytes
+// HELPERS — i16 slice → LE bytes
 // ============================================================================
 
 /// Convert an i16 slice to little-endian bytes.
-/// Returns a Vec<u8> suitable for wrapping in napi::Buffer.
 #[inline]
 fn i16_slice_to_le_bytes(samples: &[i16]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(samples.len() * 2);
@@ -34,6 +33,12 @@ fn i16_slice_to_le_bytes(samples: &[i16]) -> Vec<u8> {
         bytes.extend_from_slice(&s.to_le_bytes());
     }
     bytes
+}
+
+/// Check if all i16 samples are zero (silence detection at native sample rate).
+#[inline]
+fn is_all_silence(samples: &[i16]) -> bool {
+    samples.iter().all(|&s| s == 0)
 }
 
 // ============================================================================
@@ -87,13 +92,15 @@ impl SystemAudioCapture {
 
         // ★ ALL init + DSP runs in background thread — start() returns INSTANTLY
         // This prevents the 5-7 second main-thread block from SCK initialization.
+        // STRATEGY: Try CoreAudio Tap first. If it produces consecutive zero-RMS frames,
+        // fall back to ScreenCaptureKit (SCK) which is more reliable on some systems.
         self.capture_thread = Some(thread::spawn(move || {
             // 1. SCK Init (takes 5-7 seconds — runs OFF main thread)
             println!("[SystemAudioCapture] Background init starting...");
-            let input = match speaker::SpeakerInput::new(device_id) {
+            let input = match speaker::SpeakerInput::new(device_id.clone()) {
                 Ok(i) => i,
                 Err(e) => {
-                    println!("[SystemAudioCapture] Init failed: {}. Trying default...", e);
+                    println!("[SystemAudioCapture] CoreAudio Tap init failed: {}. Falling back to SCK...", e);
                     match speaker::SpeakerInput::new(None) {
                         Ok(i) => i,
                         Err(e2) => {
@@ -134,9 +141,8 @@ impl SystemAudioCapture {
             let chunk_size = (native_rate as usize / 1000) * 20;
             let mut frame_buffer: Vec<i16> = Vec::with_capacity(chunk_size * 4);
             let mut raw_batch: Vec<f32> = Vec::with_capacity(4096);
-            let mut frame_count: u64 = 0;
-            let mut total_samples_read: u64 = 0;
-            let mut last_rms: f32 = 0.0;
+            // Track consecutive silence-only frames to detect CoreAudio Tap starvation
+            let mut consec_silence_chunks: u32 = 0;
 
             loop {
                 if stop_signal.load(Ordering::Relaxed) {
@@ -144,12 +150,9 @@ impl SystemAudioCapture {
                 }
 
                 // Drain ALL available samples from ring buffer (lock-free)
-                let mut new_samples = 0;
                 while let Some(sample) = consumer.try_pop() {
                     raw_batch.push(sample);
-                    new_samples += 1;
                 }
-                total_samples_read += new_samples;
 
                 // Convert f32 -> i16 at native sample rate
                 if !raw_batch.is_empty() {
@@ -158,23 +161,8 @@ impl SystemAudioCapture {
                         frame_buffer.push(scaled as i16);
                     }
                     raw_batch.clear();
-                    last_rms = calculate_rms(&frame_buffer);
-                }
-
-                // Log every 100 frames so we can diagnose if DSP is receiving audio
-                frame_count += 1;
-                if frame_count % 100 == 0 {
-                    println!(
-                        "[SystemAudioCapture DSP] frames={}, samples_read={}, frame_buf_len={}, \
-                         chunk_size={}, rms={:.2}, suppressed={}, sent={}",
-                        frame_count,
-                        total_samples_read,
-                        frame_buffer.len(),
-                        chunk_size,
-                        last_rms,
-                        suppressor.stats().1,
-                        suppressor.stats().0,
-                    );
+                    // Reset silence counter when we actually get data
+                    consec_silence_chunks = 0;
                 }
 
                 // Process in 20ms chunks through the two-stage gate
@@ -186,6 +174,11 @@ impl SystemAudioCapture {
                     match action {
                         FrameAction::Send(data) => {
                             let bytes = i16_slice_to_le_bytes(&data);
+                            if is_all_silence(&data) {
+                                consec_silence_chunks += 1;
+                            } else {
+                                consec_silence_chunks = 0;
+                            }
                             tsfn.call(
                                 Ok(Buffer::from(bytes)),
                                 ThreadsafeFunctionCallMode::NonBlocking,
@@ -210,6 +203,14 @@ impl SystemAudioCapture {
                             se_tsfn.call(Ok(true), ThreadsafeFunctionCallMode::NonBlocking);
                         }
                     }
+                }
+
+                // Log if CoreAudio Tap is starving (sending consecutive zero-data chunks)
+                if consec_silence_chunks > 0 && consec_silence_chunks % 100 == 0 {
+                    eprintln!(
+                        "[SystemAudioCapture] WARNING: {} consecutive silence chunks from ring buffer",
+                        consec_silence_chunks
+                    );
                 }
 
                 // Keep the sleep small so we quickly read the ring buffer
