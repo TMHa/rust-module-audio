@@ -1071,6 +1071,7 @@ dependencies = [
  "cpal",
  "machine-uid",
  "napi",
+ "napi-build",
  "napi-derive",
  "once_cell",
  "rand",
