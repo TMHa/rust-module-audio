@@ -19,7 +19,7 @@ pub mod silence_suppression;
 pub mod speaker;
 
 use crate::audio_config::DSP_POLL_MS;
-use crate::silence_suppression::{FrameAction, SilenceSuppressionConfig, SilenceSuppressor};
+use crate::silence_suppression::{calculate_rms, FrameAction, SilenceSuppressionConfig, SilenceSuppressor};
 
 // ============================================================================
 // HELPERS — i16 slice → zero-copy LE bytes
