@@ -72,12 +72,12 @@ impl SilenceSuppressionConfig {
     /// Create config for system audio (very permissive - system audio is quieter, VAD disabled)
     pub fn for_system_audio() -> Self {
         Self {
-            speech_threshold_rms: 30.0,
+            speech_threshold_rms: 15.0,  // Lowered from 30 to catch quiet speaker audio
             speech_hangover: Duration::from_millis(300),
             silence_keepalive_interval: Duration::from_millis(100),
-            adaptive_multiplier: 3.0,
-            adaptive_min_floor: 10.0,
-            ema_alpha: 0.02,
+            adaptive_multiplier: 2.5,    // Reduced from 3.0 for faster adaptation
+            adaptive_min_floor: 5.0,     // Lowered from 10.0 — don't suppress quiet speaker audio
+            ema_alpha: 0.01,             // Slower adaptation — keeps threshold low longer
             native_sample_rate: 48000,
             use_vad: false, // VAD rejects speaker audio — use RMS-only like v2.0.3
         }

@@ -134,6 +134,9 @@ impl SystemAudioCapture {
             let chunk_size = (native_rate as usize / 1000) * 20;
             let mut frame_buffer: Vec<i16> = Vec::with_capacity(chunk_size * 4);
             let mut raw_batch: Vec<f32> = Vec::with_capacity(4096);
+            let mut frame_count: u64 = 0;
+            let mut total_samples_read: u64 = 0;
+            let mut last_rms: f32 = 0.0;
 
             loop {
                 if stop_signal.load(Ordering::Relaxed) {
@@ -141,9 +144,12 @@ impl SystemAudioCapture {
                 }
 
                 // Drain ALL available samples from ring buffer (lock-free)
+                let mut new_samples = 0;
                 while let Some(sample) = consumer.try_pop() {
                     raw_batch.push(sample);
+                    new_samples += 1;
                 }
+                total_samples_read += new_samples;
 
                 // Convert f32 -> i16 at native sample rate
                 if !raw_batch.is_empty() {
@@ -152,6 +158,23 @@ impl SystemAudioCapture {
                         frame_buffer.push(scaled as i16);
                     }
                     raw_batch.clear();
+                    last_rms = calculate_rms(&frame_buffer);
+                }
+
+                // Log every 100 frames so we can diagnose if DSP is receiving audio
+                frame_count += 1;
+                if frame_count % 100 == 0 {
+                    println!(
+                        "[SystemAudioCapture DSP] frames={}, samples_read={}, frame_buf_len={}, \
+                         chunk_size={}, rms={:.2}, suppressed={}, sent={}",
+                        frame_count,
+                        total_samples_read,
+                        frame_buffer.len(),
+                        chunk_size,
+                        last_rms,
+                        suppressor.stats().1,
+                        suppressor.stats().0,
+                    );
                 }
 
                 // Process in 20ms chunks through the two-stage gate
