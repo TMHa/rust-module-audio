@@ -8,6 +8,6 @@
     "targets": ["defaults"]
   },
   "devDependencies": {
-    "@napi-rs/cli": "^2.22.0"
+    "@napi-rs/cli": "^3.6.0"
   }
 }
